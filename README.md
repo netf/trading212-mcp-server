@@ -153,6 +153,10 @@ cp .env.example .env   # then edit it
 | `ENVIRONMENT` | `demo` | `demo` (paper trading) or `live` |
 | `TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http` |
 | `TRADING212_HTTP_ADDR` | `127.0.0.1:8000` | Listen address for the HTTP transports |
+| `MCP_AUTH_TOKENS` | — (required for HTTP) | Bearer tokens accepted by the HTTP transports, as comma-separated `name:token` pairs. See [Authentication](#authentication) |
+| `MCP_AUTH_DISABLED` | `false` | Set to `true` to serve HTTP without authentication. Only allowed on a loopback address |
+| `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
+| `LOG_FORMAT` | `text` | `text` or `json` |
 | `TRADING212_ACCOUNT_TTL` | `15` | Cache seconds for account, positions, orders, pies and export status |
 | `TRADING212_HISTORY_TTL` | `300` | Cache seconds for history endpoints |
 | `TRADING212_METADATA_TTL` | `3600` | Cache seconds for instruments and exchanges |
@@ -160,8 +164,35 @@ cp .env.example .env   # then edit it
 TTLs are non-negative seconds (fractions allowed); `0` disables caching for
 that family.
 
-Flags: `-env-file PATH`, `-v` (debug and protocol logs), `-version`. Logs
-always go to stderr so they never corrupt the stdio transport.
+Flags: `-env-file PATH`, `-v` (debug and protocol logs; overrides
+`LOG_LEVEL`), `-version`.
+
+### Logging
+
+Logs go to stderr (so they never corrupt the stdio transport), as `text` or
+`json` lines. At the default `info` level you get:
+
+- a startup line with the version, environment, transport, address and the
+  names of the authorised clients, and a warning when a live account is served
+  over HTTP or authentication is disabled;
+- one `tool call` line per tool call, with the tool, client, session, duration
+  and outcome. Tools that change the account (orders, cancellations, pies,
+  exports) also log their arguments, as an audit trail. Read-only tools log
+  arguments only at `debug`;
+- one `resource read` line per resource read, and `session started` with the
+  client's name and version;
+- for the HTTP transports, an access log line per request: method, path,
+  status, duration, bytes, client name, remote address, `X-Forwarded-For`,
+  user agent and request ID. Rejected logins are logged at `warn` with the
+  reason, never the token.
+
+`debug` adds every Trading 212 API call (method, path, status, attempt,
+duration) and cache hits. Rate limiting and connection failures are logged at
+`warn`. Credentials, query strings and request bodies are never logged.
+
+Every HTTP request gets an `X-Request-ID` (a well-formed client-supplied value
+is kept), which is returned in the response and appears on the access log and
+tool call lines, so the two can be correlated.
 
 ## Connecting a client
 
@@ -219,12 +250,75 @@ TRANSPORT=streamable-http ./bin/trading212-mcp-server   # http://127.0.0.1:8000/
 TRANSPORT=sse ./bin/trading212-mcp-server               # http://127.0.0.1:8000/sse
 ```
 
-For example, in Cursor: `{"mcpServers": {"trading212": {"url": "http://127.0.0.1:8000/mcp"}}}`.
+`GET /healthz` answers `ok` without authentication, for tunnels and uptime
+checks. Request bodies are limited to 1 MB and cross-origin browser requests
+are rejected.
 
-The HTTP endpoints have no authentication of their own; anyone who can reach
-them can use your Trading 212 key. Keep the default loopback address. Requests
-whose `Host` header isn't localhost and cross-origin browser requests are
-rejected.
+#### Authentication
+
+The HTTP transports require a bearer token and refuse to start without one.
+Give each client its own named token, so you can revoke one without the
+others and see in the logs which client did what:
+
+```bash
+echo "MCP_AUTH_TOKENS=grok:$(openssl rand -hex 32),laptop:$(openssl rand -hex 32)" >> .env
+```
+
+Tokens must be at least 32 characters from the bearer-token alphabet
+(letters, digits and `-._~+/=`). Clients send them as
+`Authorization: Bearer <token>`. The server compares SHA-256 digests in
+constant time, and each MCP session is bound to the client that created it,
+so one token cannot take over another client's session. To rotate a token,
+add the new one under a new name, switch the client over, then remove the
+old entry and restart.
+
+For local experiments only, `MCP_AUTH_DISABLED=true` serves without
+authentication, and is rejected unless `TRADING212_HTTP_ADDR` is a loopback
+address. Without authentication the SDK's DNS-rebinding protection stays on,
+so requests whose `Host` header isn't localhost are rejected.
+
+For example, in Cursor:
+
+```json
+{"mcpServers": {"trading212": {"url": "http://127.0.0.1:8000/mcp",
+  "headers": {"Authorization": "Bearer <token>"}}}}
+```
+
+#### Exposing the server to a remote client (e.g. Grok)
+
+Keep the server on `127.0.0.1` and publish it through a tunnel that
+terminates TLS, such as [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+or [Tailscale Funnel](https://tailscale.com/kb/1223/funnel). Never expose the
+plain HTTP port directly.
+
+```bash
+TRANSPORT=streamable-http ./bin/trading212-mcp-server &
+cloudflared tunnel --url http://127.0.0.1:8000   # or a named tunnel on your domain
+```
+
+Then point the client at `https://<your-host>/mcp` with its token. With xAI's
+[remote MCP tools](https://docs.x.ai/developers/tools/remote-mcp):
+
+```python
+mcp(
+    server_url="https://<your-host>/mcp",
+    server_label="trading212",
+    authorization="<grok token>",
+    allowed_tool_names=["fetch_account_summary", "fetch_all_open_positions"],
+)
+```
+
+Before you do this:
+
+- **Write tools are available to every authenticated client.** Grok's remote
+  MCP tools do not ask for approval before calling a tool. If the remote
+  client should not trade, create a separate Trading 212 API key without
+  `orders:execute` and `pies:write` for this server, and restrict
+  `allowed_tool_names` on the client side.
+- Tool results (your positions, balances and orders) pass through the
+  client provider's servers.
+- Treat tokens like passwords; rotate one if it appears anywhere it
+  shouldn't.
 
 ### Docker
 

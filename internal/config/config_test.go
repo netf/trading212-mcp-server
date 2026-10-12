@@ -1,11 +1,21 @@
 package config
 
 import (
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+)
+
+// Test tokens are long enough to pass validation and distinctive enough to
+// spot if they ever leak into output.
+const (
+	tokenA = "tokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	tokenB = "tokenBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 )
 
 func lookupFrom(m map[string]string) LookupFunc {
@@ -28,8 +38,10 @@ func TestLoadDefaults(t *testing.T) {
 		AccountTTL:  DefaultAccountTTL,
 		HistoryTTL:  DefaultHistoryTTL,
 		MetadataTTL: DefaultMetadataTTL,
+		LogLevel:    slog.LevelInfo,
+		LogFormat:   LogFormatText,
 	}
-	if cfg != want {
+	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("got %+v, want %+v", cfg, want)
 	}
 }
@@ -41,6 +53,7 @@ func TestLoadOverridesAndDotEnvPrecedence(t *testing.T) {
 		"TRANSPORT":              "streamable-http",
 		"TRADING212_ACCOUNT_TTL": "0",
 		"TRADING212_HISTORY_TTL": "1.5",
+		"MCP_AUTH_TOKENS":        "grok:" + tokenA,
 	}
 	dotenv := map[string]string{
 		"TRADING212_API_KEY":      "file-key",
@@ -90,9 +103,114 @@ func TestLoadErrors(t *testing.T) {
 }
 
 func TestStringHidesSecrets(t *testing.T) {
-	s := Config{APIKey: "super-secret-key", APISecret: "super-secret"}.String()
-	if strings.Contains(s, "super-secret") {
+	s := Config{
+		APIKey:     "super-secret-key",
+		APISecret:  "super-secret",
+		AuthTokens: []AuthToken{{Name: "grok", Secret: tokenA}},
+	}.String()
+	if strings.Contains(s, "super-secret") || strings.Contains(s, tokenA) {
 		t.Fatalf("String leaked credentials: %s", s)
+	}
+	if !strings.Contains(s, "grok") {
+		t.Errorf("String should name auth clients: %s", s)
+	}
+}
+
+func TestAuthTokenStringHidesSecret(t *testing.T) {
+	tok := AuthToken{Name: "grok", Secret: tokenA}
+	for _, s := range []string{tok.String(), fmt.Sprint(tok), fmt.Sprintf("%v %+v", tok, tok)} {
+		if strings.Contains(s, tokenA) {
+			t.Fatalf("leaked secret: %s", s)
+		}
+	}
+}
+
+func TestLoadAuthTokens(t *testing.T) {
+	env := map[string]string{
+		"TRADING212_API_KEY": "k",
+		"TRANSPORT":          "streamable-http",
+		"MCP_AUTH_TOKENS":    " grok:" + tokenA + " , laptop.home:" + tokenB + " ",
+	}
+	cfg, err := Load(lookupFrom(env), nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []AuthToken{{Name: "grok", Secret: tokenA}, {Name: "laptop.home", Secret: tokenB}}
+	if !reflect.DeepEqual(cfg.AuthTokens, want) {
+		t.Fatalf("got %v, want %v", cfg.AuthTokens, want)
+	}
+}
+
+func TestLoadLogging(t *testing.T) {
+	env := map[string]string{"TRADING212_API_KEY": "k", "LOG_LEVEL": "DEBUG", "LOG_FORMAT": "JSON"}
+	cfg, err := Load(lookupFrom(env), nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LogLevel != slog.LevelDebug || cfg.LogFormat != LogFormatJSON {
+		t.Fatalf("got level=%v format=%q", cfg.LogLevel, cfg.LogFormat)
+	}
+}
+
+func TestLoadAuthDisabledOnLoopback(t *testing.T) {
+	for _, addr := range []string{"127.0.0.1:8000", "localhost:8000", "[::1]:8000"} {
+		env := map[string]string{
+			"TRADING212_API_KEY":   "k",
+			"TRANSPORT":            "sse",
+			"MCP_AUTH_DISABLED":    "true",
+			"TRADING212_HTTP_ADDR": addr,
+		}
+		cfg, err := Load(lookupFrom(env), nil)
+		if err != nil {
+			t.Fatalf("%s: Load: %v", addr, err)
+		}
+		if !cfg.AuthDisabled || len(cfg.AuthTokens) != 0 {
+			t.Fatalf("%s: got %+v", addr, cfg)
+		}
+	}
+}
+
+func TestLoadAuthErrors(t *testing.T) {
+	http := func(extra map[string]string) map[string]string {
+		m := map[string]string{"TRADING212_API_KEY": "k", "TRANSPORT": "streamable-http"}
+		for k, v := range extra {
+			m[k] = v
+		}
+		return m
+	}
+	tests := map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"http without tokens":   {http(nil), "MCP_AUTH_TOKENS must be set"},
+		"sse without tokens":    {map[string]string{"TRADING212_API_KEY": "k", "TRANSPORT": "sse"}, "MCP_AUTH_TOKENS must be set"},
+		"missing name":          {http(map[string]string{"MCP_AUTH_TOKENS": ":" + tokenA}), "entry 1: name"},
+		"missing separator":     {http(map[string]string{"MCP_AUTH_TOKENS": tokenA}), "entry 1: expected NAME:TOKEN"},
+		"empty entry":           {http(map[string]string{"MCP_AUTH_TOKENS": "grok:" + tokenA + ",,"}), "entry 2: expected NAME:TOKEN"},
+		"bad name":              {http(map[string]string{"MCP_AUTH_TOKENS": "gr ok:" + tokenA}), "entry 1: name"},
+		"short token":           {http(map[string]string{"MCP_AUTH_TOKENS": "grok:short"}), "at least 32"},
+		"bad token characters":  {http(map[string]string{"MCP_AUTH_TOKENS": "grok:" + tokenA + "\"" + tokenB}), "may only contain"},
+		"duplicate name":        {http(map[string]string{"MCP_AUTH_TOKENS": "grok:" + tokenA + ",grok:" + tokenB}), `duplicate name "grok"`},
+		"duplicate token":       {http(map[string]string{"MCP_AUTH_TOKENS": "a:" + tokenA + ",b:" + tokenA}), "reuses the token"},
+		"bad disabled flag":     {http(map[string]string{"MCP_AUTH_DISABLED": "maybe"}), "MCP_AUTH_DISABLED"},
+		"disabled with tokens":  {http(map[string]string{"MCP_AUTH_DISABLED": "true", "MCP_AUTH_TOKENS": "grok:" + tokenA}), "not both"},
+		"disabled on all hosts": {http(map[string]string{"MCP_AUTH_DISABLED": "true", "TRADING212_HTTP_ADDR": ":8000"}), "loopback"},
+		"disabled on public ip": {http(map[string]string{"MCP_AUTH_DISABLED": "true", "TRADING212_HTTP_ADDR": "0.0.0.0:8000"}), "loopback"},
+		"bad log level":         {map[string]string{"TRADING212_API_KEY": "k", "LOG_LEVEL": "loud"}, "LOG_LEVEL"},
+		"bad log format":        {map[string]string{"TRADING212_API_KEY": "k", "LOG_FORMAT": "xml"}, "LOG_FORMAT"},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(tc.env), nil)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("got %v, want error mentioning %q", err, tc.want)
+			}
+			for _, secret := range []string{tokenA, tokenB} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked a token: %v", err)
+				}
+			}
+		})
 	}
 }
 

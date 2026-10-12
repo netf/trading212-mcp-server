@@ -23,7 +23,7 @@ type OptionalTickerInput struct {
 	Ticker string `json:"ticker,omitempty" jsonschema:"optional Trading 212 ticker filter, e.g. AAPL_US_EQ"`
 }
 
-func (h *handlers) registerAccountTools(s *mcp.Server) {
+func (h *handlers) registerAccountTools(s *toolRegistry) {
 	summary := func(ctx context.Context, _ struct{}) (*t212.AccountSummary, error) {
 		return h.client.AccountSummary(ctx)
 	}

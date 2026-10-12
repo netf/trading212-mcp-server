@@ -13,11 +13,11 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/netf/trading212-mcp-server/internal/config"
+	"github.com/netf/trading212-mcp-server/internal/httpserver"
 	"github.com/netf/trading212-mcp-server/internal/server"
 	"github.com/netf/trading212-mcp-server/internal/trading212"
 )
@@ -49,13 +49,6 @@ func run(args []string, stderr io.Writer) error {
 		return nil
 	}
 
-	level := slog.LevelInfo
-	if *verbose {
-		level = slog.LevelDebug
-	}
-	// stdout carries the stdio transport, so logs always go to stderr.
-	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
-
 	dotenv, err := config.ReadDotEnv(*envFile)
 	if err != nil {
 		return err
@@ -64,14 +57,19 @@ func run(args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	logger.Debug("loaded configuration", "config", cfg.String())
+	if *verbose {
+		cfg.LogLevel = slog.LevelDebug
+	}
+	logger := newLogger(stderr, cfg.LogLevel, cfg.LogFormat)
+	logStartup(logger, cfg)
 
 	client, err := trading212.NewClient(cfg.APIKey, cfg.APISecret, string(cfg.Environment),
 		trading212.WithCacheTTLs(trading212.TTLs{
 			Account:  cfg.AccountTTL,
 			History:  cfg.HistoryTTL,
 			Metadata: cfg.MetadataTTL,
-		}))
+		}),
+		trading212.WithLogger(logger))
 	if err != nil {
 		return fmt.Errorf("create trading 212 client: %w", err)
 	}
@@ -84,48 +82,72 @@ func run(args []string, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// With bearer auth on, the SDK's localhost Host-header check is redundant
+	// (a DNS-rebinding page cannot supply the token) and would reject
+	// requests forwarded by a local tunnel such as cloudflared.
+	authOn := len(cfg.AuthTokens) > 0
+	getServer := func(*http.Request) *mcp.Server { return srv }
+	var (
+		path    string
+		handler http.Handler
+	)
 	switch cfg.Transport {
 	case config.TransportStdio:
+		logger.Info("serving on stdio")
 		if err := srv.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("serve stdio: %w", err)
 		}
+		logger.Info("stopped")
 		return nil
 	case config.TransportSSE:
-		handler := mcp.NewSSEHandler(func(*http.Request) *mcp.Server { return srv }, nil)
-		return serveHTTP(ctx, logger, cfg.HTTPAddr, "/sse", handler)
+		path = "/sse"
+		handler = mcp.NewSSEHandler(getServer, &mcp.SSEOptions{DisableLocalhostProtection: authOn})
 	case config.TransportStreamableHTTP:
-		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv },
-			&mcp.StreamableHTTPOptions{Logger: logger})
-		return serveHTTP(ctx, logger, cfg.HTTPAddr, "/mcp", handler)
+		path = "/mcp"
+		handler = mcp.NewStreamableHTTPHandler(getServer,
+			&mcp.StreamableHTTPOptions{Logger: logger, DisableLocalhostProtection: authOn})
 	default:
 		return fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}
+	handler = httpserver.Handler(handler, httpserver.Options{Path: path, Tokens: cfg.AuthTokens, Logger: logger})
+	if err := httpserver.Serve(ctx, logger, cfg.HTTPAddr, handler); err != nil {
+		return err //nolint:wrapcheck // already wrapped with context by httpserver.
+	}
+	logger.Info("stopped")
+	return nil
 }
 
-func serveHTTP(ctx context.Context, logger *slog.Logger, addr, path string, handler http.Handler) error {
-	mux := http.NewServeMux()
-	mux.Handle(path, http.NewCrossOriginProtection().Handler(handler))
-	httpServer := &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
+// newLogger writes to w, which is stderr in production: stdout carries the
+// stdio transport.
+func newLogger(w io.Writer, level slog.Level, format config.LogFormat) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: level}
+	if format == config.LogFormatJSON {
+		return slog.New(slog.NewJSONHandler(w, opts))
 	}
+	return slog.New(slog.NewTextHandler(w, opts))
+}
 
-	errCh := make(chan error, 1)
-	go func() {
-		logger.Info("listening", "url", "http://"+addr+path)
-		errCh <- httpServer.ListenAndServe()
-	}()
+func logStartup(logger *slog.Logger, cfg config.Config) {
+	attrs := []any{
+		"version", version,
+		"environment", cfg.Environment,
+		"transport", cfg.Transport,
+		"log_level", cfg.LogLevel.String(),
+	}
+	if cfg.Transport.HTTP() {
+		attrs = append(attrs, "addr", cfg.HTTPAddr, "auth", !cfg.AuthDisabled, "auth_clients", cfg.AuthClientNames())
+	}
+	logger.Info("starting trading212-mcp-server", attrs...)
+	logger.Debug("loaded configuration", "config", cfg.String())
 
-	select {
-	case err := <-errCh:
-		return fmt.Errorf("serve http: %w", err)
-	case <-ctx.Done():
+	if !cfg.Transport.HTTP() {
+		return
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown http: %w", err)
+	if cfg.AuthDisabled {
+		logger.Warn("authentication is disabled; anyone who can reach " + cfg.HTTPAddr + " can use the Trading 212 account")
 	}
-	return nil
+	if cfg.Environment == config.EnvironmentLive {
+		logger.Warn("serving a live account over HTTP; authenticated clients can place orders and change pies " +
+			"unless the Trading 212 API key lacks those permissions")
+	}
 }

@@ -57,7 +57,7 @@ var timeValidityField = field{
 const orderCaveats = " Orders execute in the account's primary currency. Not idempotent: never resend after an " +
 	"error whose outcome is unknown; check fetch_all_orders first."
 
-func (h *handlers) registerOrderTools(s *mcp.Server) {
+func (h *handlers) registerOrderTools(s *toolRegistry) {
 	addTool(s, &mcp.Tool{
 		Name:        "fetch_all_orders",
 		Description: "Fetch all active (not yet filled, cancelled or expired) orders.",

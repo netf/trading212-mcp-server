@@ -56,7 +56,7 @@ func containsFold(s *string, lowerNeedle string) bool {
 	return s != nil && strings.Contains(strings.ToLower(*s), lowerNeedle)
 }
 
-func (h *handlers) registerMetadataTools(s *mcp.Server) {
+func (h *handlers) registerMetadataTools(s *toolRegistry) {
 	addTool(s, &mcp.Tool{
 		Name:        "search_instrument",
 		Description: "List tradeable instruments, optionally filtered by ticker or name (case-insensitive substring).",

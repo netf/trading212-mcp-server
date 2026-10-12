@@ -76,6 +76,11 @@ type harness struct {
 
 func newHarness(t *testing.T, opts ...t212.Option) *harness {
 	t.Helper()
+	return newHarnessWith(t, Options{Version: "test"}, opts...)
+}
+
+func newHarnessWith(t *testing.T, serverOpts Options, opts ...t212.Option) *harness {
+	t.Helper()
 	h := &harness{api: &fakeAPI{}}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -102,7 +107,7 @@ func newHarness(t *testing.T, opts ...t212.Option) *harness {
 	}
 	ctx := context.Background()
 	serverTransport, clientTransport := mcp.NewInMemoryTransports()
-	ss, err := New(client, Options{Version: "test"}).Connect(ctx, serverTransport, nil)
+	ss, err := New(client, serverOpts).Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

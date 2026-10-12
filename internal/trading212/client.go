@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"net/url"
@@ -44,6 +45,7 @@ type Client struct {
 	ttls          TTLs
 	now           func() time.Time
 	sleep         func(context.Context, time.Duration) error
+	logger        *slog.Logger
 }
 
 // Option customises a Client.
@@ -62,6 +64,16 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithCacheTTLs configures response caching. The default disables caching.
 func WithCacheTTLs(ttls TTLs) Option {
 	return func(c *Client) { c.ttls = ttls }
+}
+
+// WithLogger logs upstream requests at debug, and rate limiting and
+// connection failures at warn. Credentials are never logged.
+func WithLogger(l *slog.Logger) Option {
+	return func(c *Client) {
+		if l != nil {
+			c.logger = l
+		}
+	}
 }
 
 // WithClock overrides time and sleeping, for tests.
@@ -98,8 +110,9 @@ func NewClient(apiKey, apiSecret, environment string, opts ...Option) (*Client, 
 		httpClient: &http.Client{
 			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		},
-		now:   time.Now,
-		sleep: sleepContext,
+		now:    time.Now,
+		sleep:  sleepContext,
+		logger: slog.New(slog.DiscardHandler),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -138,6 +151,8 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	key := method + " " + target
 	if cacheable {
 		if e, ok := c.cache.get(key, ttl, metadata); ok {
+			c.logger.DebugContext(ctx, "trading212 cache hit", "path", path,
+				"age_s", c.now().Sub(e.retrievedAt).Seconds())
 			observe(ctx, CacheObservation{CacheHit: true, RetrievedAt: e.retrievedAt.UTC(), TTLSeconds: ttl.Seconds()})
 			return decode(e.body, out)
 		}
@@ -193,7 +208,9 @@ func (c *Client) send(ctx context.Context, method, path, target string, payload 
 	deadline := c.now().Add(requestBudget)
 
 	for attempt := 0; ; attempt++ {
-		body, apiErr, err := c.attempt(ctx, method, target, path, payload)
+		start := c.now()
+		body, status, apiErr, err := c.attempt(ctx, method, target, path, payload)
+		c.logAttempt(ctx, method, path, attempt+1, c.now().Sub(start), status, apiErr, err)
 		retryable := method == http.MethodGet && attempt < maxAttempts-1
 		var delay time.Duration
 		switch {
@@ -232,7 +249,25 @@ func (c *Client) send(ctx context.Context, method, path, target string, payload 
 	}
 }
 
-func (c *Client) attempt(ctx context.Context, method, target, path string, payload []byte) ([]byte, *APIError, error) {
+// logAttempt records one HTTP exchange with the API. It deliberately omits
+// the query string, headers and bodies.
+func (c *Client) logAttempt(ctx context.Context, method, path string, attempt int, d time.Duration,
+	status int, apiErr *APIError, err error,
+) {
+	if err != nil {
+		c.logger.WarnContext(ctx, "trading212 request failed", "method", method, "path", path,
+			"attempt", attempt, "error", err.Error())
+		return
+	}
+	c.logger.DebugContext(ctx, "trading212 request", "method", method, "path", path, "status", status,
+		"attempt", attempt, "duration_ms", float64(d.Microseconds())/1000)
+	if apiErr != nil && apiErr.StatusCode == http.StatusTooManyRequests {
+		c.logger.WarnContext(ctx, "trading212 rate limited", "method", method, "path", path,
+			"retry_after_s", apiErr.RetryAfter.Seconds())
+	}
+}
+
+func (c *Client) attempt(ctx context.Context, method, target, path string, payload []byte) ([]byte, int, *APIError, error) {
 	ctx, cancel := context.WithTimeout(ctx, attemptTimeout)
 	defer cancel()
 
@@ -242,7 +277,7 @@ func (c *Client) attempt(ctx context.Context, method, target, path string, paylo
 	}
 	req, err := http.NewRequestWithContext(ctx, method, target, reader)
 	if err != nil {
-		return nil, nil, fmt.Errorf("build request: %w", err)
+		return nil, 0, nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", c.authorization)
 	req.Header.Set("Accept", "application/json")
@@ -253,17 +288,17 @@ func (c *Client) attempt(ctx context.Context, method, target, path string, paylo
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("send request: %w", err)
+		return nil, 0, nil, fmt.Errorf("send request: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
-		return nil, nil, fmt.Errorf("read response: %w", err)
+		return nil, resp.StatusCode, nil, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return body, nil, nil
+		return body, resp.StatusCode, nil, nil
 	}
-	return nil, &APIError{
+	return nil, resp.StatusCode, &APIError{
 		StatusCode: resp.StatusCode,
 		Method:     method,
 		Path:       path,

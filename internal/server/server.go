@@ -30,7 +30,8 @@ buy and negative to sell. GBX prices are in pence (100 GBX = 1 GBP).`
 // Options configures the MCP server.
 type Options struct {
 	Version string
-	// Logger receives application warnings. Nil discards them.
+	// Logger receives request logs (tool calls, resource reads, sessions)
+	// and application warnings. Nil discards them.
 	Logger *slog.Logger
 	// ProtocolLogger receives MCP session/transport logs from the SDK. Nil
 	// disables them.
@@ -52,14 +53,23 @@ func New(client *trading212.Client, opts Options) *mcp.Server {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	h := &handlers{client: client, logger: logger}
-	h.registerAccountTools(s)
-	h.registerOrderTools(s)
-	h.registerPieTools(s)
-	h.registerHistoryTools(s)
-	h.registerMetadataTools(s)
+	tools := &toolRegistry{Server: s, writes: map[string]bool{}}
+	h.registerAccountTools(tools)
+	h.registerOrderTools(tools)
+	h.registerPieTools(tools)
+	h.registerHistoryTools(tools)
+	h.registerMetadataTools(tools)
 	h.registerResources(s)
 	h.registerPrompts(s)
+	s.AddReceivingMiddleware(logRequests(logger, tools.writes))
 	return s
+}
+
+// toolRegistry adds tools to a server and remembers which ones change
+// account state, so their calls can be audit-logged.
+type toolRegistry struct {
+	*mcp.Server
+	writes map[string]bool
 }
 
 type handlers struct {
@@ -89,8 +99,11 @@ func mutating(title string) *mcp.ToolAnnotations {
 
 // addTool registers a typed tool whose handler only sees the context and
 // input, and attaches cache observations to the result metadata.
-func addTool[In, Out any](s *mcp.Server, t *mcp.Tool, h func(context.Context, In) (Out, error)) {
-	mcp.AddTool(s, t, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
+func addTool[In, Out any](s *toolRegistry, t *mcp.Tool, h func(context.Context, In) (Out, error)) {
+	if t.Annotations == nil || !t.Annotations.ReadOnlyHint {
+		s.writes[t.Name] = true
+	}
+	mcp.AddTool(s.Server, t, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (*mcp.CallToolResult, Out, error) {
 		ctx, obs := trading212.WithObserver(ctx)
 		out, err := h(ctx, in)
 		if err != nil {
