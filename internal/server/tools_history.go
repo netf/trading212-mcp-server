@@ -40,7 +40,7 @@ func historyQuery(in HistoryInput) t212.HistoryQuery {
 	return t212.HistoryQuery{Cursor: in.Cursor, Ticker: in.Ticker, Limit: in.Limit, NextPagePath: in.NextPagePath}
 }
 
-func (h *handlers) registerHistoryTools(s *mcp.Server) {
+func (h *handlers) registerHistoryTools(s *toolRegistry) {
 	limitDefault := map[string]field{"limit": {Default: 20}}
 
 	addTool(s, &mcp.Tool{

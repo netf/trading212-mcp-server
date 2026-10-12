@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -31,6 +33,18 @@ const (
 	TransportStreamableHTTP Transport = "streamable-http"
 )
 
+// LogFormat selects how log records are rendered.
+type LogFormat string
+
+const (
+	LogFormatText LogFormat = "text"
+	LogFormatJSON LogFormat = "json"
+)
+
+// MinAuthTokenLength is the shortest bearer token accepted, so tokens carry
+// enough entropy that guessing one is infeasible.
+const MinAuthTokenLength = 32
+
 const (
 	DefaultHTTPAddr    = "127.0.0.1:8000"
 	DefaultAccountTTL  = 15 * time.Second
@@ -48,12 +62,45 @@ type Config struct {
 	AccountTTL  time.Duration
 	HistoryTTL  time.Duration
 	MetadataTTL time.Duration
+	// AuthTokens are the bearer tokens accepted by the HTTP transports.
+	AuthTokens []AuthToken
+	// AuthDisabled explicitly allows the HTTP transports to run without
+	// authentication on a loopback address.
+	AuthDisabled bool
+	LogLevel     slog.Level
+	LogFormat    LogFormat
+}
+
+// AuthToken is a named bearer token. The name identifies the client in logs.
+type AuthToken struct {
+	Name   string
+	Secret string
+}
+
+// String never includes the secret.
+func (t AuthToken) String() string { return t.Name + ":[REDACTED]" }
+
+// GoString never includes the secret.
+func (t AuthToken) GoString() string { return t.String() }
+
+// HTTP reports whether the transport serves over HTTP.
+func (t Transport) HTTP() bool { return t == TransportSSE || t == TransportStreamableHTTP }
+
+// AuthClientNames lists the names of the configured auth tokens.
+func (c Config) AuthClientNames() []string {
+	names := make([]string, 0, len(c.AuthTokens))
+	for _, t := range c.AuthTokens {
+		names = append(names, t.Name)
+	}
+	return names
 }
 
 // String never includes credentials.
 func (c Config) String() string {
-	return fmt.Sprintf("Config{Environment:%s Transport:%s HTTPAddr:%s AccountTTL:%s HistoryTTL:%s MetadataTTL:%s}",
-		c.Environment, c.Transport, c.HTTPAddr, c.AccountTTL, c.HistoryTTL, c.MetadataTTL)
+	return fmt.Sprintf("Config{Environment:%s Transport:%s HTTPAddr:%s AccountTTL:%s HistoryTTL:%s MetadataTTL:%s "+
+		"AuthClients:%v AuthDisabled:%t LogLevel:%s LogFormat:%s}",
+		c.Environment, c.Transport, c.HTTPAddr, c.AccountTTL, c.HistoryTTL, c.MetadataTTL,
+		c.AuthClientNames(), c.AuthDisabled, c.LogLevel, c.LogFormat)
 }
 
 // LookupFunc matches the signature of os.LookupEnv.
@@ -78,6 +125,7 @@ func Load(lookup LookupFunc, dotenv map[string]string) (Config, error) {
 		Environment: Environment(strings.ToLower(get("ENVIRONMENT", string(EnvironmentDemo)))),
 		Transport:   Transport(strings.ToLower(get("TRANSPORT", string(TransportStdio)))),
 		HTTPAddr:    get("TRADING212_HTTP_ADDR", DefaultHTTPAddr),
+		LogFormat:   LogFormat(strings.ToLower(get("LOG_FORMAT", string(LogFormatText)))),
 	}
 
 	var errs []error
@@ -94,6 +142,33 @@ func Load(lookup LookupFunc, dotenv map[string]string) (Config, error) {
 	default:
 		errs = append(errs, fmt.Errorf("TRANSPORT must be %q, %q or %q, got %q",
 			TransportStdio, TransportSSE, TransportStreamableHTTP, cfg.Transport))
+	}
+
+	if err := cfg.LogLevel.UnmarshalText([]byte(get("LOG_LEVEL", "info"))); err != nil {
+		errs = append(errs, errors.New("LOG_LEVEL must be debug, info, warn or error"))
+	}
+	switch cfg.LogFormat {
+	case LogFormatText, LogFormatJSON:
+	default:
+		errs = append(errs, fmt.Errorf("LOG_FORMAT must be %q or %q, got %q", LogFormatText, LogFormatJSON, cfg.LogFormat))
+	}
+
+	if raw := get("MCP_AUTH_TOKENS", ""); raw != "" {
+		tokens, err := parseAuthTokens(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MCP_AUTH_TOKENS: %w", err))
+		}
+		cfg.AuthTokens = tokens
+	}
+	if raw := get("MCP_AUTH_DISABLED", ""); raw != "" {
+		disabled, err := strconv.ParseBool(raw)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("MCP_AUTH_DISABLED must be true or false, got %q", raw))
+		}
+		cfg.AuthDisabled = disabled
+	}
+	if err := cfg.validateAuth(); err != nil {
+		errs = append(errs, err)
 	}
 
 	ttls := []struct {
@@ -118,6 +193,102 @@ func Load(lookup LookupFunc, dotenv map[string]string) (Config, error) {
 		return Config{}, fmt.Errorf("invalid configuration: %w", err)
 	}
 	return cfg, nil
+}
+
+// validateAuth fails closed: the HTTP transports need tokens unless
+// authentication is explicitly disabled on a loopback-only address. Loopback
+// alone is not treated as trusted, because tunnels such as cloudflared
+// forward public traffic from 127.0.0.1.
+func (c Config) validateAuth() error {
+	if c.AuthDisabled {
+		if len(c.AuthTokens) > 0 {
+			return errors.New("set MCP_AUTH_TOKENS or MCP_AUTH_DISABLED, not both")
+		}
+		if c.Transport.HTTP() && !isLoopbackAddr(c.HTTPAddr) {
+			return fmt.Errorf("MCP_AUTH_DISABLED is only allowed when TRADING212_HTTP_ADDR is a loopback address, got %q", c.HTTPAddr)
+		}
+		return nil
+	}
+	if c.Transport.HTTP() && len(c.AuthTokens) == 0 {
+		return fmt.Errorf("MCP_AUTH_TOKENS must be set for the %s transport "+
+			"(or set MCP_AUTH_DISABLED=true to serve without authentication on a loopback address)", c.Transport)
+	}
+	return nil
+}
+
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// parseAuthTokens parses comma-separated NAME:TOKEN pairs. Errors identify
+// entries by position and never echo token values.
+func parseAuthTokens(raw string) ([]AuthToken, error) {
+	entries := strings.Split(raw, ",")
+	tokens := make([]AuthToken, 0, len(entries))
+	names := map[string]bool{}
+	secrets := map[string]string{}
+	for i, entry := range entries {
+		n := i + 1
+		name, secret, ok := strings.Cut(strings.TrimSpace(entry), ":")
+		if !ok {
+			return nil, fmt.Errorf("entry %d: expected NAME:TOKEN", n)
+		}
+		if !validTokenName(name) {
+			return nil, fmt.Errorf("entry %d: name must be 1-64 letters, digits, '.', '_' or '-'", n)
+		}
+		if len(secret) < MinAuthTokenLength {
+			return nil, fmt.Errorf("entry %d (%s): token must be at least %d characters; generate one with `openssl rand -hex 32`",
+				n, name, MinAuthTokenLength)
+		}
+		if !validTokenSecret(secret) {
+			return nil, fmt.Errorf("entry %d (%s): token may only contain letters, digits and -._~+/=", n, name)
+		}
+		if names[name] {
+			return nil, fmt.Errorf("entry %d: duplicate name %q", n, name)
+		}
+		if other, dup := secrets[secret]; dup {
+			return nil, fmt.Errorf("entry %d (%s): reuses the token of %q; give each client its own token", n, name, other)
+		}
+		names[name] = true
+		secrets[secret] = name
+		tokens = append(tokens, AuthToken{Name: name, Secret: secret})
+	}
+	return tokens, nil
+}
+
+func validTokenName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if !isAlphanumeric(r) && r != '.' && r != '_' && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// validTokenSecret accepts the RFC 6750 b64token alphabet, which is what a
+// client can send in an Authorization: Bearer header.
+func validTokenSecret(secret string) bool {
+	for _, r := range secret {
+		if !isAlphanumeric(r) && !strings.ContainsRune("-._~+/=", r) {
+			return false
+		}
+	}
+	return true
+}
+
+func isAlphanumeric(r rune) bool {
+	return 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || '0' <= r && r <= '9'
 }
 
 func parseSeconds(raw string, def time.Duration) (time.Duration, error) {

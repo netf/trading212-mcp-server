@@ -77,7 +77,7 @@ func optional(s string) *string {
 // Trading 212 marks every pies endpoint as deprecated in its API reference.
 const piesDeprecation = " Note: Trading 212 has deprecated the pies API; it may change or be removed."
 
-func (h *handlers) registerPieTools(s *mcp.Server) {
+func (h *handlers) registerPieTools(s *toolRegistry) {
 	addTool(s, &mcp.Tool{
 		Name:        "fetch_pies",
 		Description: "Fetch all pies with their cash, progress, result and dividend details." + piesDeprecation,
