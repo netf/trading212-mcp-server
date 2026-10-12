@@ -1,0 +1,17 @@
+name: API spec drift
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-spec:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare the published Trading 212 OpenAPI document with the snapshot
+        run: make check-spec
