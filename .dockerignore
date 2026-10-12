@@ -5,3 +5,6 @@ coverage.out
 .env
 .env.*
 !.env.example
+
+# Cloudflare Worker (not part of the image)
+cloudflare
