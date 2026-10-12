@@ -320,6 +320,41 @@ Before you do this:
 - Treat tokens like passwords; rotate one if it appears anywhere it
   shouldn't.
 
+### Cloudflare Containers
+
+`cloudflare/` deploys the server as a [Cloudflare Container](https://developers.cloudflare.com/containers/)
+behind a Worker, so it is reachable at `https://trading212-mcp-server.<subdomain>.workers.dev/mcp`
+without keeping your own machine running. It builds the repository's
+Dockerfile and needs Docker locally and the Workers Paid plan.
+
+```bash
+cd cloudflare
+npm install
+npx wrangler login
+npx wrangler secret put TRADING212_API_KEY
+npx wrangler secret put TRADING212_API_SECRET   # if your key has a secret
+npx wrangler secret put MCP_AUTH_TOKENS         # e.g. grok:<openssl rand -hex 32>
+npm run deploy
+```
+
+`ENVIRONMENT` (default `live`) and `LOG_LEVEL` are plain vars in
+`cloudflare/wrangler.jsonc`. Use an API key without `orders:execute` and
+`pies:write` unless the remote client should trade.
+
+How it behaves:
+
+- All requests go to a single container instance (`max_instances: 1`),
+  because MCP sessions and the cache are held in memory.
+- The container stops after an hour without requests (`sleepAfter` in
+  `cloudflare/src/index.ts`) and restarts on every deploy. The next request
+  starts it again after a few seconds, with an empty cache and no sessions;
+  clients have to reinitialise their MCP session.
+- The Worker forwards requests unchanged; bearer-token auth is still done by
+  the Go server. The server logs JSON lines; find them under Containers in
+  the Cloudflare dashboard (`npm run tail` shows the Worker's own logs).
+- Outbound requests don't come from a fixed IP address, so this won't work
+  with an IP-restricted Trading 212 API key.
+
 ### Docker
 
 ```bash

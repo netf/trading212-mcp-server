@@ -1,0 +1,28 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trading212-mcp-server",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "vars": {
+    "ENVIRONMENT": "live",
+    "LOG_LEVEL": "info"
+  },
+  "containers": [
+    {
+      "class_name": "Trading212",
+      // Builds the repository's Dockerfile; the repo root is the build context.
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      "instance_type": "lite",
+      // One instance only: sessions and the cache are in memory.
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [{ "name": "TRADING212", "class_name": "Trading212" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Trading212"] }]
+}

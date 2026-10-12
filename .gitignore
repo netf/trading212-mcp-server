@@ -16,3 +16,8 @@ coverage.*
 .vscode/
 *.swp
 .DS_Store
+
+# Cloudflare Worker
+cloudflare/node_modules/
+cloudflare/.wrangler/
+cloudflare/.dev.vars*
